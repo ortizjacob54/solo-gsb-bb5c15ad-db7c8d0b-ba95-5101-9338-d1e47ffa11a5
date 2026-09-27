@@ -10,7 +10,10 @@
 * 提交接口在单条 ``BEGIN IMMEDIATE`` 事务内完成“版本检查 + 方案可用性
   复检 + 插入 + 版本自增”，任何一步失败即整体回滚，绝不部分分配；
   提交响应使用的版本与分配结果同样取自该写事务内部，不会混入其它
-  并发提交之后的状态。
+  并发提交之后的状态；
+* 保留区替换接口同样在单条 ``BEGIN IMMEDIATE`` 事务内完成“版本检查 +
+  与已分配地址的冲突复核 + 保留记录整体重写 + 版本自增”，失败即整体
+  回滚，池状态与版本均不变。
 """
 from __future__ import annotations
 
@@ -361,6 +364,93 @@ class Database:
                 conn.rollback()
                 raise ConflictError(f"reclaim failed: {exc}") from exc
         return state, tuple(state.allocated)
+
+    # -- 保留子网的整体替换 -------------------------------------------------
+
+    def replace_reservations(
+        self,
+        expected_version: int,
+        desired: tuple[ipaddress._BaseNetwork, ...],
+    ) -> tuple[PoolState, tuple[ipaddress._BaseNetwork, ...]]:
+        """把保留子网整体替换为 ``desired`` 覆盖范围的最少规范 CIDR 集合。
+
+        ``desired`` 是完整的保留地址目标集合：允许为空（清空保留区），
+        也可含重叠或相邻网段；先合并为连续区间，再切出覆盖范围相同且
+        **数量最少**的规范 CIDR。在单条 ``BEGIN IMMEDIATE`` 事务内完成
+        版本检查、与已分配地址的冲突复核、保留记录重写与版本自增：任何
+        一步失败（版本过期 / 目标范围与已分配地址相交）即整体回滚，池
+        状态与版本均不变。
+
+        返回写事务内读取的新状态与规范化后的保留 CIDR 序列（按网络地址
+        升序）。
+        """
+        with self._conn() as conn:
+            try:
+                # 立即获取写锁，与并发提交/回收/替换互斥。
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
+                ).fetchone()
+                current_version = row["version"]
+                if current_version != expected_version:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"pool version changed: expected {expected_version}, "
+                        f"current {current_version}"
+                    )
+
+                parent = ipaddress.ip_network(row["parent_cidr"], strict=True)
+                # 规范化：重叠/相邻区间先 _collapse_ranges 合并，再由
+                # _ranges_to_cidrs 对每个连续区间贪心切出最大对齐块，
+                # 块数即覆盖该区间所需的最少规范 CIDR 数量。
+                desired_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in desired]
+                )
+                normalized = [
+                    ipaddress.ip_network((s, p), strict=True)
+                    for s, p in _ranges_to_cidrs(
+                        parent.max_prefixlen, desired_ranges
+                    )
+                ]
+
+                allocated = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in conn.execute(
+                        "SELECT cidr FROM subnets WHERE kind = 'allocated'"
+                    ).fetchall()
+                ]
+                # 冲突复核：目标保留范围不得与任何已分配地址相交（与既有
+                # 保留子网无关——它们即将被整体替换）。
+                for net in normalized:
+                    if any(net.overlaps(other) for other in allocated):
+                        conn.rollback()
+                        raise ConflictError(
+                            f"reserved range {net} overlaps allocated "
+                            f"addresses"
+                        )
+
+                # 整体重写保留子网：删除全部 reserved 行后写回规范化结果。
+                conn.execute("DELETE FROM subnets WHERE kind = 'reserved'")
+                conn.executemany(
+                    "INSERT INTO subnets (cidr, kind) "
+                    "VALUES (?, 'reserved')",
+                    [(str(net),) for net in normalized],
+                )
+                conn.execute(
+                    "UPDATE pool_meta SET version = version + 1 WHERE id = 1"
+                )
+                # 与提交/回收相同：在同一写事务内读取替换后的状态。
+                state = self._load_state(conn)
+                conn.commit()
+                self._after_commit(conn)
+            except ConflictError:
+                raise
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise ConflictError(
+                    f"replace reservations failed: {exc}"
+                ) from exc
+        return state, tuple(normalized)
 
 
 def _assert_disjoint(networks: tuple[ipaddress._BaseNetwork, ...]) -> None:

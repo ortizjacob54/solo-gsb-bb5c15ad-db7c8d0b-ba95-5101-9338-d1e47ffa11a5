@@ -56,6 +56,10 @@ class ConflictError(Exception):
     """提交冲突：池版本已变化，或方案在当前池状态下不再可用。"""
 
 
+class ReservationInputError(Exception):
+    """保留目标集合非法：越出父网段或地址族与父网段不一致（HTTP 422）。"""
+
+
 def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -361,6 +365,106 @@ class Database:
                 conn.rollback()
                 raise ConflictError(f"reclaim failed: {exc}") from exc
         return state, tuple(state.allocated)
+
+    # -- 保留子网的整体替换 -------------------------------------------------
+
+    def replace_reservations(
+        self,
+        expected_version: int,
+        desired: tuple[ipaddress._BaseNetwork, ...],
+    ) -> PoolState:
+        """把保留子网整体替换为 ``desired`` 覆盖范围的最少规范 CIDR 集合。
+
+        ``desired`` 是保留地址的**完整目标集合**（而非增量）：允许为空
+        （清空全部保留地址）、相互重叠或相邻；落库前先合并相交/相邻区间，
+        再重写为覆盖范围相同且数量最少的规范 CIDR。
+
+        在单条 ``BEGIN IMMEDIATE`` 事务内完成：父网段/地址族校验、版本
+        核对、与已分配地址的冲突复核、删除并重写保留记录、版本自增。
+        任何一步失败即整体回滚，池状态与版本均不变。返回写事务内读取的
+        新状态。
+        """
+        with self._conn() as conn:
+            try:
+                # 立即获取写锁，与并发提交/回收/替换互斥。
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
+                ).fetchone()
+                parent = ipaddress.ip_network(row["parent_cidr"], strict=True)
+
+                # 输入校验：同族且完全落在父网段内（非法输入，非状态冲突）。
+                for net in desired:
+                    if net.version != parent.version or not net.subnet_of(
+                        parent
+                    ):
+                        conn.rollback()
+                        raise ReservationInputError(
+                            f"reserved CIDR {net} is outside of pool {parent}"
+                        )
+
+                current_version = row["version"]
+                if current_version != expected_version:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"pool version changed: expected {expected_version}, "
+                        f"current {current_version}"
+                    )
+
+                # 规范化：合并相交/相邻区间后，对每个连续区间贪心切出最大
+                # 对齐块，块数即覆盖范围相同的最少规范 CIDR 数量；空列表
+                # 得到空集合（清空保留区）。
+                desired_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in desired]
+                )
+                normalized = [
+                    ipaddress.ip_network((s, p), strict=True)
+                    for s, p in _ranges_to_cidrs(
+                        parent.max_prefixlen, desired_ranges
+                    )
+                ]
+
+                # 冲突复核：目标范围不得与任何已分配地址相交（与既有保留
+                # 子网重叠无关紧要——它们将被整体替换）。
+                allocated = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in conn.execute(
+                        "SELECT cidr FROM subnets WHERE kind = 'allocated'"
+                    ).fetchall()
+                ]
+                collisions = [
+                    str(net)
+                    for net in normalized
+                    if any(net.overlaps(other) for other in allocated)
+                ]
+                if collisions:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"desired reservations overlap allocated addresses: "
+                        f"{collisions}"
+                    )
+
+                # 整体替换保留记录：删除全部 reserved 行后写回规范化结果。
+                conn.execute("DELETE FROM subnets WHERE kind = 'reserved'")
+                conn.executemany(
+                    "INSERT INTO subnets (cidr, kind) VALUES (?, 'reserved')",
+                    [(str(net),) for net in normalized],
+                )
+                conn.execute(
+                    "UPDATE pool_meta SET version = version + 1 WHERE id = 1"
+                )
+                # 与提交/回收相同：在同一写事务内读取替换后的状态。
+                state = self._load_state(conn)
+                conn.commit()
+                self._after_commit(conn)
+            except (ConflictError, ReservationInputError):
+                raise
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise ConflictError(
+                    f"replace reservations failed: {exc}"
+                ) from exc
+        return state
 
 
 def _assert_disjoint(networks: tuple[ipaddress._BaseNetwork, ...]) -> None:

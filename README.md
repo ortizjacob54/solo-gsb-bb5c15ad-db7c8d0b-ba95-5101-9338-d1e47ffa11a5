@@ -11,6 +11,8 @@
 
 回收接口对**已分配地址做部分回收**：传入池版本与一个规范 CIDR，该 CIDR 必须**完全由当前已分配地址覆盖**（可跨越相邻的多条分配记录）；在单条写事务内扣除目标地址、把仍被占用的部分重写为最少的规范 CIDR 并自增版本。若含未分配或保留地址、越出父网段或版本过期，则返回 `409 Conflict` 且**地址池保持不变**。
 
+保留区替换接口把**保留地址整体替换**为目标集合：传入池版本与 `desired_cidrs`（允许空列表、重叠与相邻网段），在单条写事务内规范化为**覆盖范围相同且数量最少**的规范 CIDR、重写全部保留记录并自增版本。目标范围与已分配地址相交或版本过期时返回 `409 Conflict` 且**地址池保持不变**；非规范、越出父网段或地址族不一致的输入返回 `422 Unprocessable Entity`。
+
 ---
 
 ## 一条命令启动
@@ -70,6 +72,7 @@ docker compose down -v         # 同时删除数据卷（彻底重置）
 | POST | `/api/allocations/preview` | **预演**：不修改状态，返回池版本与最优方案 |
 | POST | `/api/allocations/commit` | **提交**：携带版本与方案，原子落库或返回 409 |
 | POST | `/api/allocations/reclaim` | **部分回收**：回收完全被已分配地址覆盖的规范 CIDR |
+| POST | `/api/pool/reservations/replace` | **替换保留区**：以目标集合整体重写保留子网（规范化为最少 CIDR） |
 
 ### 1. 查询池状态
 
@@ -195,6 +198,41 @@ CIDR 写法非规范（如主机位非零的 `10.1.0.1/24` 或无法解析）返
 
 > 回收不要求目标与既有分配记录的边界对齐，但目标本身必须是规范 CIDR；扣除后系统会重新规范化全部已分配地址，因此回收后 `allocated_cidrs` 里的记录集合可能与回收前完全不同（数目通常更少），其覆盖的地址集合则严格等于“原已分配集合减去目标”。
 
+### 5. 替换保留地址（整体替换，原子）
+
+把当前池版本与保留地址的**完整目标集合** `desired_cidrs` 提交到替换接口。目标集合允许为**空列表**（清空全部保留地址），也允许网段之间**重叠、包含或相邻**；落库时系统会合并相交/相邻区间，规范化为**覆盖范围相同且数量最少**的规范 CIDR 后整体重写保留记录。
+
+```bash
+curl -X POST http://localhost:8000/api/pool/reservations/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"pool_version": 4,
+       "desired_cidrs": ["10.0.0.0/24", "10.0.1.0/24", "10.0.2.128/25"]}'
+```
+
+成功（在单个 SQLite 写事务内规范化、重写保留记录、版本自增）：
+
+```json
+{
+  "status": "replaced",
+  "pool_version": 5,
+  "reserved_cidrs": ["10.0.0.0/23", "10.0.2.128/25"],
+  "free_cidrs": ["..."]
+}
+```
+
+- `desired_cidrs` 是保留地址的**完整目标集合**（不是增量）：上例中相邻的 `10.0.0.0/24` + `10.0.1.0/24` 被规范化为 `10.0.0.0/23`；
+- `reserved_cidrs`：替换后的保留子网，已规范化为数量最少的规范 CIDR；
+- `pool_version`：自增后的新版本，后续预演/提交/回收/替换均以此为准。
+
+成功替换后，**池状态查询（`GET /api/pool`）与后续分配预演立即采用新保留区**：新保留的空间不再可被分配，被移出保留区的空间立即可被 `/api/allocations/preview` 选中并提交。
+
+失败时返回 `409 Conflict`，响应体 `detail` 说明原因，**数据库不发生任何写入（版本与地址池均不变）**：
+
+- `pool_version` 已过期（被其它提交/回收/替换改变，乐观并发控制）；
+- 目标范围与**已分配地址**相交（含完全包含某条分配记录；与既有保留子网重叠不视为冲突——它们将被整体替换）。
+
+输入非法时返回 `422 Unprocessable Entity`：CIDR 写法非规范（如主机位非零的 `10.0.0.1/24`）、无法解析、越出父网段（含父网段的超网）或地址族与父网段不一致。
+
 ---
 
 ## 正确性与并发保证
@@ -220,6 +258,12 @@ CIDR 写法非规范（如主机位非零的 `10.1.0.1/24` 或无法解析）返
   同一版本并发写时**恰有一个**成功。回收响应中的已分配/空闲 CIDR 同样在
   本写事务内部读取，提交后的 `GET /api/pool` 与预演立即基于新版本与回收后
   的占用集计算。
+- 保留区替换接口同样使用 `BEGIN IMMEDIATE` 单事务：父网段/地址族校验 →
+  版本核对 → 与已分配地址的冲突复核 → 删除并以最少规范 CIDR 重写保留
+  记录 → 版本自增。任一环节失败立即回滚，池状态与版本均不变；替换与并发
+  提交/回收/替换之间由写锁互斥，同一版本并发写时**恰有一个**成功。替换
+  响应中的保留/空闲 CIDR 同样在本写事务内部读取，提交后的 `GET /api/pool`
+  与预演立即基于新版本与新保留区计算。
 
 ---
 
@@ -237,6 +281,7 @@ DB_PATH=./cidr_pool.db PARENT_CIDR=10.0.0.0/16 \
 python3 -m tests.test_allocator_bruteforce   # 4000 组 IPv4 暴力对照
 python3 -m tests.test_api                    # 接口端到端 + 冲突/原子性
 python3 -m tests.test_reclaim                # 部分回收端到端：跨记录/重写/冲突
+python3 -m tests.test_reservations_replace   # 保留区整体替换：规范化/冲突/并发
 python3 -m tests.test_concurrency            # 并发交错回归：快照读取与提交响应绑定
 ```
 
@@ -253,6 +298,7 @@ tests/
   test_dense_reserved.py
   test_api.py
   test_reclaim.py
+  test_reservations_replace.py
   test_concurrency.py
 Dockerfile
 docker-compose.yml

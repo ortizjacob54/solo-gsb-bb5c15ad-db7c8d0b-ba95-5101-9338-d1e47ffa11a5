@@ -1,4 +1,4 @@
-"""FastAPI 接口：池状态查询、预演与原子提交。"""
+"""FastAPI 接口：池状态查询、预演与原子提交、部分回收与保留区替换。"""
 from __future__ import annotations
 
 import ipaddress
@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .allocator import CidrAllocationSolver, InfeasibleError
 from .config import settings
-from .db import ConflictError, Database, PoolState
+from .db import ConflictError, Database, PoolState, ReservationInputError
 
 _db: Database | None = None
 
@@ -138,6 +138,31 @@ class ReclaimResponse(BaseModel):
     free_cidrs: list[str]
 
 
+class ReplaceReservationsRequest(BaseModel):
+    pool_version: int = Field(..., ge=1, description="当前池版本号。")
+    desired_cidrs: list[str] = Field(
+        ...,
+        description=(
+            "保留地址的完整目标集合（而非增量）：规范 CIDR 列表，允许空列表"
+            "（清空全部保留地址）、相互重叠或相邻；落库时规范化为覆盖范围"
+            "相同且数量最少的 CIDR。"
+        ),
+    )
+
+    @field_validator("desired_cidrs")
+    @classmethod
+    def _validate_cidrs(cls, values: list[str]) -> list[str]:
+        # strict=True：主机位非零的非对齐写法直接 422，不静默改写成网络地址。
+        return [str(ipaddress.ip_network(raw, strict=True)) for raw in values]
+
+
+class ReplaceReservationsResponse(BaseModel):
+    status: Literal["replaced"]
+    pool_version: int
+    reserved_cidrs: list[str]
+    free_cidrs: list[str]
+
+
 # ---------------------------------------------------------------------------
 # 辅助
 # ---------------------------------------------------------------------------
@@ -173,6 +198,39 @@ def healthz() -> dict[str, str]:
 def get_pool(db: Database = Depends(get_db)) -> PoolInfo:
     """返回当前地址池配置、版本与剩余空闲 CIDR。"""
     return _pool_info(db.get_state())
+
+
+@app.post(
+    "/api/pool/reservations/replace",
+    response_model=ReplaceReservationsResponse,
+    tags=["pool"],
+)
+def replace_reservations(
+    body: ReplaceReservationsRequest, db: Database = Depends(get_db)
+) -> ReplaceReservationsResponse:
+    """整体替换保留地址：以 desired_cidrs 的覆盖范围为准重写保留记录。
+
+    允许空列表与重叠/相邻网段，落库时规范化为覆盖范围相同且数量最少的
+    规范 CIDR。版本核对、与已分配地址的冲突复核、保留记录替换与版本
+    自增在同一 SQLite 写事务内完成；任何一步失败即整体回滚，池状态与
+    版本均不变。成功后池状态查询与后续预演/提交立即采用新保留区。
+    """
+    networks = tuple(
+        ipaddress.ip_network(c, strict=True) for c in body.desired_cidrs
+    )
+    try:
+        state = db.replace_reservations(body.pool_version, networks)
+    except ReservationInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    free, _ = _free_cidrs(state)
+    return ReplaceReservationsResponse(
+        status="replaced",
+        pool_version=state.version,
+        reserved_cidrs=[str(n) for n in state.reserved],
+        free_cidrs=[str(n) for n in free],
+    )
 
 
 @app.post("/api/allocations/preview", response_model=PreviewResponse, tags=["allocations"])
